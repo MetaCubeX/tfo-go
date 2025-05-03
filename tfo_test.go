@@ -81,34 +81,6 @@ type testCase struct {
 var cases []testCase
 
 func init() {
-	// Initialize [listenConfigCases].
-	for i := range listenConfigCases {
-		c := &listenConfigCases[i]
-		switch c.mptcp {
-		case mptcpUseDefault:
-		case mptcpEnabled:
-			c.listenConfig.SetMultipathTCP(true)
-		case mptcpDisabled:
-			c.listenConfig.SetMultipathTCP(false)
-		default:
-			panic("unreachable")
-		}
-	}
-
-	// Initialize [dialerCases].
-	for i := range dialerCases {
-		c := &dialerCases[i]
-		switch c.mptcp {
-		case mptcpUseDefault:
-		case mptcpEnabled:
-			c.dialer.SetMultipathTCP(true)
-		case mptcpDisabled:
-			c.dialer.SetMultipathTCP(false)
-		default:
-			panic("unreachable")
-		}
-	}
-
 	// Generate [cases].
 	cases = make([]testCase, 0, len(listenConfigCases)*len(dialerCases))
 	for _, lc := range listenConfigCases {
