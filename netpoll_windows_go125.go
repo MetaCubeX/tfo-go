@@ -1,4 +1,4 @@
-//go:build windows && go1.23 && !go1.25
+//go:build windows && go1.25
 
 package tfo
 
@@ -38,15 +38,61 @@ type operation struct {
 	bufs   []syscall.WSABuf
 }
 
-// execIO executes a single IO operation o. It submits and cancels
-// IO in the current thread for systems where Windows CancelIoEx API
-// is available. Alternatively, it passes the request onto
-// runtime netpoll and waits for completion or cancels request.
-func execIO(o *operation, submit func(o *operation) error) (int, error) {
-	if o.fd.pd.runtimeCtx == 0 {
-		return 0, errors.New("internal error: polling on unsupported descriptor type")
+func (o *operation) setEvent() {
+	h, err := windows.CreateEvent(nil, 0, 0, nil)
+	if err != nil {
+		// This shouldn't happen when all CreateEvent arguments are zero.
+		panic(err)
 	}
+	// Set the low bit so that the external IOCP doesn't receive the completion packet.
+	o.o.HEvent = syscall.Handle(h | 1)
+}
 
+// waitIO waits for the IO operation o to complete.
+func waitIO(o *operation) error {
+	if o.fd.isBlocking {
+		panic("can't wait on blocking operations")
+	}
+	fd := o.fd
+	if !fd.pollable() {
+		// The overlapped handle is not added to the runtime poller,
+		// the only way to wait for the IO to complete is block until
+		// the overlapped event is signaled.
+		_, err := syscall.WaitForSingleObject(o.o.HEvent, syscall.INFINITE)
+		return err
+	}
+	// Wait for our request to complete.
+	err := fd.pd.wait(int(o.mode), fd.isFile)
+	switch err {
+	case nil, ErrNetClosing, ErrFileClosing, ErrDeadlineExceeded:
+		// No other error is expected.
+	default:
+		panic("unexpected runtime.netpoll error: " + err.Error())
+	}
+	return err
+}
+
+// cancelIO cancels the IO operation o and waits for it to complete.
+func cancelIO(o *operation) {
+	fd := o.fd
+	if !fd.pollable() {
+		return
+	}
+	// Cancel our request.
+	err := syscall.CancelIoEx(fd.Sysfd, &o.o)
+	// Assuming ERROR_NOT_FOUND is returned, if IO is completed.
+	if err != nil && err != syscall.ERROR_NOT_FOUND {
+		// TODO(brainman): maybe do something else, but panic.
+		panic(err)
+	}
+	fd.pd.waitCanceled(int(o.mode))
+}
+
+// execIO executes a single IO operation o.
+// It supports both synchronous and asynchronous IO.
+// o.qty and o.flags are set to zero before calling submit
+// to avoid reusing the values from a previous call.
+func execIO(o *operation, submit func(o *operation) error) (int, error) {
 	fd := o.fd
 	// Notify runtime netpoll about starting IO.
 	err := fd.pd.prepare(int(o.mode), fd.isFile)
@@ -54,67 +100,59 @@ func execIO(o *operation, submit func(o *operation) error) (int, error) {
 		return 0, err
 	}
 	// Start IO.
+	if !fd.isBlocking && o.o.HEvent == 0 && !fd.pollable() {
+		// If the handle is opened for overlapped IO but we can't
+		// use the runtime poller, then we need to use an
+		// event to wait for the IO to complete.
+		o.setEvent()
+	}
+	o.qty = 0
+	o.flags = 0
 	err = submit(o)
+	var waitErr error
+	// Blocking operations shouldn't return ERROR_IO_PENDING.
+	// Continue without waiting if that happens.
+	if !o.fd.isBlocking && (err == syscall.ERROR_IO_PENDING || (err == nil && !o.fd.skipSyncNotif)) {
+		// IO started asynchronously or completed synchronously but
+		// a sync notification is required. Wait for it to complete.
+		waitErr = waitIO(o)
+		if waitErr != nil {
+			// IO interrupted by "close" or "timeout".
+			cancelIO(o)
+			// We issued a cancellation request, but the IO operation may still succeeded
+			// before the cancellation request runs.
+		}
+		if fd.isFile {
+			err = windows.GetOverlappedResult(windows.Handle(fd.Sysfd), (*windows.Overlapped)(unsafe.Pointer(&o.o)), &o.qty, false)
+		} else {
+			err = windows.WSAGetOverlappedResult(windows.Handle(fd.Sysfd), (*windows.Overlapped)(unsafe.Pointer(&o.o)), &o.qty, false, &o.flags)
+		}
+	}
 	switch err {
-	case nil:
-		// IO completed immediately
-		if o.fd.skipSyncNotif {
-			// No completion message will follow, so return immediately.
-			return int(o.qty), nil
+	case syscall.ERROR_OPERATION_ABORTED:
+		// ERROR_OPERATION_ABORTED may have been caused by us. In that case,
+		// map it to our own error. Don't do more than that, each submitted
+		// function may have its own meaning for each error.
+		if waitErr != nil {
+			// IO canceled by the poller while waiting for completion.
+			err = waitErr
+		} else if fd.kind == kindPipe && fd.closing() {
+			// Close uses CancelIoEx to interrupt concurrent I/O for pipes.
+			// If the fd is a pipe and the Write was interrupted by CancelIoEx,
+			// we assume it is interrupted by Close.
+			err = errClosing(fd.isFile)
 		}
-		// Need to get our completion message anyway.
-	case syscall.ERROR_IO_PENDING:
-		// IO started, and we have to wait for its completion.
-		err = nil
-	default:
-		return 0, err
-	}
-	// Wait for our request to complete.
-	err = fd.pd.wait(int(o.mode), fd.isFile)
-	if err == nil {
-		err = windows.WSAGetOverlappedResult(windows.Handle(fd.Sysfd), (*windows.Overlapped)(unsafe.Pointer(&o.o)), &o.qty, false, &o.flags)
-		// All is good. Extract our IO results and return.
-		if err != nil {
-			// More data available. Return back the size of received data.
-			if err == syscall.ERROR_MORE_DATA || err == windows.WSAEMSGSIZE {
-				return int(o.qty), err
-			}
-			return 0, err
+	case windows.ERROR_IO_INCOMPLETE:
+		// waitIO couldn't wait for the IO to complete.
+		if waitErr != nil {
+			// The wait error will be more informative.
+			err = waitErr
 		}
-		return int(o.qty), nil
 	}
-	// IO is interrupted by "close" or "timeout"
-	netpollErr := err
-	switch netpollErr {
-	case ErrNetClosing, ErrFileClosing, ErrDeadlineExceeded:
-		// will deal with those.
-	default:
-		panic("unexpected runtime.netpoll error: " + netpollErr.Error())
-	}
-	// Cancel our request.
-	err = syscall.CancelIoEx(fd.Sysfd, &o.o)
-	// Assuming ERROR_NOT_FOUND is returned, if IO is completed.
-	if err != nil && err != syscall.ERROR_NOT_FOUND {
-		// TODO(brainman): maybe do something else, but panic.
-		panic(err)
-	}
-	// Wait for cancellation to complete.
-	fd.pd.waitCanceled(int(o.mode))
-	err = windows.WSAGetOverlappedResult(windows.Handle(fd.Sysfd), (*windows.Overlapped)(unsafe.Pointer(&o.o)), &o.qty, false, &o.flags)
-	if err != nil {
-		if err == syscall.ERROR_OPERATION_ABORTED { // IO Canceled
-			err = netpollErr
-		}
-		return 0, err
-	}
-	// We issued a cancellation request. But, it seems, IO operation succeeded
-	// before the cancellation request run. We need to treat the IO operation as
-	// succeeded (the bytes are actually sent/recv from network).
-	return int(o.qty), nil
+	return int(o.qty), err
 }
 
 // fileKind describes the kind of file.
-// Stay in sync with FD in src/internal/poll/fd_windows.go
 type fileKind byte
 
 const (
@@ -130,7 +168,7 @@ const (
 // SetFileCompletionNotificationModes crashes on some systems (see
 // https://support.microsoft.com/kb/2568167 for details).
 
-var useSetFileCompletionNotificationModes bool // determines is SetFileCompletionNotificationModes is present and safe to use
+var socketCanUseSetFileCompletionNotificationModes bool // determines is SetFileCompletionNotificationModes is present and sockets can safely use it
 
 // checkSetFileCompletionNotificationModes verifies that
 // SetFileCompletionNotificationModes Windows API is present
@@ -153,7 +191,7 @@ func checkSetFileCompletionNotificationModes() {
 			return
 		}
 	}
-	useSetFileCompletionNotificationModes = true
+	socketCanUseSetFileCompletionNotificationModes = true
 }
 
 func init() {
@@ -162,74 +200,42 @@ func init() {
 
 var serverInit sync.Once
 
-func (fd *pFD) Init(net string, pollable bool) (string, error) {
+func (fd *pFD) Init(net string, pollable bool) error {
 	switch net {
-	case "file", "dir":
+	case "file":
 		fd.kind = kindFile
 	case "console":
 		fd.kind = kindConsole
 	case "pipe":
 		fd.kind = kindPipe
-	case "tcp", "tcp4", "tcp6",
-		"udp", "udp4", "udp6",
-		"ip", "ip4", "ip6",
-		"unix", "unixgram", "unixpacket":
-		fd.kind = kindNet
 	default:
-		return "", errors.New("internal error: unknown network type " + net)
+		// We don't actually care about the various network types.
+		fd.kind = kindNet
 	}
 	fd.isFile = fd.kind != kindNet
-
-	var err error
-	if pollable {
-		// Only call init for a network socket.
-		// This means that we don't add files to the runtime poller.
-		// Adding files to the runtime poller can confuse matters
-		// if the user is doing their own overlapped I/O.
-		// See issue #21172.
-		//
-		// In general the code below avoids calling the execIO
-		// function for non-network sockets. If some method does
-		// somehow call execIO, then execIO, and therefore the
-		// calling method, will return an error, because
-		// fd.pd.runtimeCtx will be 0.
-		err = fd.pd.init(fd)
-	}
-	if err != nil {
-		return "", err
-	}
-	if pollable && useSetFileCompletionNotificationModes {
-		// We do not use events, so we can skip them always.
-		flags := uint8(syscall.FILE_SKIP_SET_EVENT_ON_HANDLE)
-		switch net {
-		case "tcp", "tcp4", "tcp6",
-			"udp", "udp4", "udp6":
-			flags |= syscall.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
-		}
-		err := syscall.SetFileCompletionNotificationModes(fd.Sysfd, flags)
-		if err == nil && flags&syscall.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS != 0 {
-			fd.skipSyncNotif = true
-		}
-	}
-	// Disable SIO_UDP_CONNRESET behavior.
-	// http://support.microsoft.com/kb/263823
-	switch net {
-	case "udp", "udp4", "udp6":
-		ret := uint32(0)
-		flag := uint32(0)
-		size := uint32(unsafe.Sizeof(flag))
-		err := syscall.WSAIoctl(fd.Sysfd, syscall.SIO_UDP_CONNRESET, (*byte)(unsafe.Pointer(&flag)), size, nil, 0, &ret, nil, 0)
-		if err != nil {
-			return "wsaioctl", err
-		}
-	}
+	fd.isBlocking = !pollable
 	fd.rop.mode = 'r'
 	fd.wop.mode = 'w'
 	fd.rop.fd = fd
 	fd.wop.fd = fd
+
+	// It is safe to add overlapped handles that also perform I/O
+	// outside of the runtime poller. The runtime poller will ignore
+	// I/O completion notifications not initiated by us.
+	err := fd.pd.init(fd)
+	if err != nil {
+		return err
+	}
 	fd.rop.runtimeCtx = fd.pd.runtimeCtx
 	fd.wop.runtimeCtx = fd.pd.runtimeCtx
-	return "", nil
+	if fd.kind != kindNet || socketCanUseSetFileCompletionNotificationModes {
+		// Non-socket handles can use SetFileCompletionNotificationModes without problems.
+		err := syscall.SetFileCompletionNotificationModes(fd.Sysfd,
+			syscall.FILE_SKIP_SET_EVENT_ON_HANDLE|syscall.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS,
+		)
+		fd.skipSyncNotif = err == nil
+	}
+	return nil
 }
 
 // Error values returned by runtime_pollReset and runtime_pollWait.
@@ -248,7 +254,7 @@ func convertErr(res int, isFile bool) error {
 	case pollErrClosing:
 		return errClosing(isFile)
 	case pollErrTimeout:
-		return os.ErrDeadlineExceeded
+		return ErrDeadlineExceeded
 	case pollErrNotPollable:
 		return ErrNotPollable
 	}
@@ -330,4 +336,8 @@ func (pd *pollDesc) waitCanceled(mode int) {
 		return
 	}
 	runtime_pollWaitCanceled(pd.runtimeCtx, mode)
+}
+
+func (pd *pollDesc) pollable() bool {
+	return pd.runtimeCtx != 0
 }
