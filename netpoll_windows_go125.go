@@ -160,6 +160,7 @@ const (
 	kindFile
 	kindConsole
 	kindPipe
+	kindFileNet
 )
 
 // This package uses the SetFileCompletionNotificationModes Windows
@@ -208,6 +209,8 @@ func (fd *pFD) Init(net string, pollable bool) error {
 		fd.kind = kindConsole
 	case "pipe":
 		fd.kind = kindPipe
+	case "file+net":
+		fd.kind = kindFileNet
 	default:
 		// We don't actually care about the various network types.
 		fd.kind = kindNet
