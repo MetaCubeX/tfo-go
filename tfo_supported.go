@@ -11,7 +11,7 @@ import (
 	_ "unsafe"
 )
 
-const comptimeNoTFO = false
+const comptimeDialNoTFO = false
 
 const (
 	defaultTCPKeepAlive  = 15 * time.Second

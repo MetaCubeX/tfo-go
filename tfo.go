@@ -61,7 +61,7 @@ func (lc *ListenConfig) tfoDisabled() bool {
 }
 
 func (lc *ListenConfig) tfoNeedsFallback() bool {
-	return lc.Fallback && (comptimeNoTFO || runtimeListenNoTFO.Load())
+	return lc.Fallback && (comptimeDialNoTFO || runtimeListenNoTFO.Load())
 }
 
 // Listen is like [net.ListenConfig.Listen] but enables TFO whenever possible,
@@ -172,7 +172,11 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string, b []b
 	if d.DisableTFO || !networkIsTCP(network) {
 		return d.dialAndWrite(ctx, network, address, b)
 	}
-	return d.dialTFO(ctx, network, address, b) // tfo_bsd+windows.go, tfo_linux.go, tfo_unsupported.go
+	tc, err := d.dialTFO(ctx, network, address, b) // tfo_bsd+windows.go, tfo_linux.go, tfo_unsupported.go
+	if err != nil {
+		return nil, err // return nil [net.Conn] instead of non-nil [net.Conn] with nil [*net.TCPConn] pointer
+	}
+	return tc, nil
 }
 
 // Dial is like [net.Dialer.Dial] but enables TFO whenever possible,

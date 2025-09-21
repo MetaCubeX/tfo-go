@@ -7,7 +7,7 @@ import (
 	"net"
 )
 
-const comptimeNoTFO = true
+const comptimeDialNoTFO = true
 
 func (*ListenConfig) listenTFO(ctx context.Context, network, address string) (net.Listener, error) {
 	return nil, ErrPlatformUnsupported
