@@ -9,10 +9,6 @@ import (
 
 const comptimeDialNoTFO = true
 
-func (*ListenConfig) listenTFO(ctx context.Context, network, address string) (net.Listener, error) {
-	return nil, ErrPlatformUnsupported
-}
-
 func (d *Dialer) dialTFO(ctx context.Context, network, address string, b []byte) (*net.TCPConn, error) {
 	if d.Fallback {
 		return d.dialAndWriteTCPConn(ctx, network, address, b)
