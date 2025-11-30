@@ -63,3 +63,11 @@ func (fd *netFD) init() error {
 	}
 	return err
 }
+
+func (fd *pFD) ConnectEx(ra syscall.Sockaddr, b []byte) (n int, err error) {
+	fd.wop.sa = ra
+	n, err = execIO(&fd.wop, func(o *operation) error {
+		return syscall.ConnectEx(o.fd.Sysfd, o.sa, &b[0], uint32(len(b)), &o.qty, &o.o)
+	})
+	return
+}

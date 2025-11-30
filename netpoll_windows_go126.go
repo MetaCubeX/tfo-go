@@ -1,4 +1,4 @@
-//go:build windows && go1.25 && !go1.26
+//go:build windows && go1.26
 
 package tfo
 
@@ -18,42 +18,25 @@ import (
 // Copied from src/internal/poll/fd_windows.go
 type operation struct {
 	// Used by IOCP interface, it must be first field
-	// of the struct, as our code rely on it.
+	// of the struct, as our code relies on it.
 	o syscall.Overlapped
 
 	// fields used by runtime.netpoll
 	runtimeCtx uintptr
 	mode       int32
-
-	// fields used only by net package
-	fd     *pFD
-	buf    syscall.WSABuf
-	msg    windows.WSAMsg
-	sa     syscall.Sockaddr
-	rsa    *syscall.RawSockaddrAny
-	rsan   int32
-	handle syscall.Handle
-	flags  uint32
-	qty    uint32
-	bufs   []syscall.WSABuf
 }
 
-func (o *operation) setEvent() {
-	h, err := windows.CreateEvent(nil, 0, 0, nil)
-	if err != nil {
-		// This shouldn't happen when all CreateEvent arguments are zero.
-		panic(err)
-	}
-	// Set the low bit so that the external IOCP doesn't receive the completion packet.
-	o.o.HEvent = syscall.Handle(h | 1)
+var operationPool = sync.Pool{
+	New: func() any {
+		return new(operation)
+	},
 }
 
 // waitIO waits for the IO operation o to complete.
-func waitIO(o *operation) error {
-	if o.fd.isBlocking {
+func (fd *pFD) waitIO(o *operation) error {
+	if fd.isBlocking {
 		panic("can't wait on blocking operations")
 	}
-	fd := o.fd
 	if !fd.pollable() {
 		// The overlapped handle is not added to the runtime poller,
 		// the only way to wait for the IO to complete is block until
@@ -73,8 +56,7 @@ func waitIO(o *operation) error {
 }
 
 // cancelIO cancels the IO operation o and waits for it to complete.
-func cancelIO(o *operation) {
-	fd := o.fd
+func (fd *pFD) cancelIO(o *operation) {
 	if !fd.pollable() {
 		return
 	}
@@ -88,44 +70,76 @@ func cancelIO(o *operation) {
 	fd.pd.waitCanceled(int(o.mode))
 }
 
+// pin pins ptr for the duration of the IO operation.
+// If fd is in blocking mode, pin does nothing.
+func (fd *pFD) pin(mode int, ptr any) {
+	if fd.isBlocking {
+		return
+	}
+	if mode == 'r' {
+		fd.readPinner.Pin(ptr)
+	} else {
+		fd.writePinner.Pin(ptr)
+	}
+}
+
 // execIO executes a single IO operation o.
 // It supports both synchronous and asynchronous IO.
-// o.qty and o.flags are set to zero before calling submit
-// to avoid reusing the values from a previous call.
-func execIO(o *operation, submit func(o *operation) error) (int, error) {
-	fd := o.fd
+func (fd *pFD) execIO(mode int, submit func(o *operation) (uint32, error)) (int, error) {
+	if mode == 'r' {
+		defer fd.readPinner.Unpin()
+	} else {
+		defer fd.writePinner.Unpin()
+	}
 	// Notify runtime netpoll about starting IO.
-	err := fd.pd.prepare(int(o.mode), fd.isFile)
+	err := fd.pd.prepare(mode, fd.isFile)
 	if err != nil {
 		return 0, err
 	}
+	o := operationPool.Get().(*operation)
+	defer operationPool.Put(o)
+	*o = operation{
+		o: syscall.Overlapped{
+			OffsetHigh: uint32(fd.offset >> 32),
+			Offset:     uint32(fd.offset),
+		},
+		runtimeCtx: fd.pd.runtimeCtx,
+		mode:       int32(mode),
+	}
 	// Start IO.
-	if !fd.isBlocking && o.o.HEvent == 0 && !fd.pollable() {
+	if !fd.isBlocking && !fd.pollable() {
 		// If the handle is opened for overlapped IO but we can't
 		// use the runtime poller, then we need to use an
 		// event to wait for the IO to complete.
-		o.setEvent()
+		h, err := windows.CreateEvent(nil, 0, 0, nil)
+		if err != nil {
+			// This shouldn't happen when all CreateEvent arguments are zero.
+			panic(err)
+		}
+		// Set the low bit so that the external IOCP doesn't receive the completion packet.
+		o.o.HEvent = syscall.Handle(h | 1)
+		defer syscall.CloseHandle(syscall.Handle(h))
 	}
-	o.qty = 0
-	o.flags = 0
-	err = submit(o)
+	fd.pin(mode, o)
+	qty, err := submit(o)
 	var waitErr error
 	// Blocking operations shouldn't return ERROR_IO_PENDING.
 	// Continue without waiting if that happens.
-	if !o.fd.isBlocking && (err == syscall.ERROR_IO_PENDING || (err == nil && !o.fd.skipSyncNotif)) {
+	if !fd.isBlocking && (err == syscall.ERROR_IO_PENDING || (err == nil && !fd.skipSyncNotif)) {
 		// IO started asynchronously or completed synchronously but
 		// a sync notification is required. Wait for it to complete.
-		waitErr = waitIO(o)
+		waitErr = fd.waitIO(o)
 		if waitErr != nil {
 			// IO interrupted by "close" or "timeout".
-			cancelIO(o)
+			fd.cancelIO(o)
 			// We issued a cancellation request, but the IO operation may still succeeded
 			// before the cancellation request runs.
 		}
 		if fd.isFile {
-			err = windows.GetOverlappedResult(windows.Handle(fd.Sysfd), (*windows.Overlapped)(unsafe.Pointer(&o.o)), &o.qty, false)
+			err = windows.GetOverlappedResult(windows.Handle(fd.Sysfd), (*windows.Overlapped)(unsafe.Pointer(&o.o)), &qty, false)
 		} else {
-			err = windows.WSAGetOverlappedResult(windows.Handle(fd.Sysfd), (*windows.Overlapped)(unsafe.Pointer(&o.o)), &o.qty, false, &o.flags)
+			var flags uint32
+			err = windows.WSAGetOverlappedResult(windows.Handle(fd.Sysfd), (*windows.Overlapped)(unsafe.Pointer(&o.o)), &qty, false, &flags)
 		}
 	}
 	switch err {
@@ -149,7 +163,7 @@ func execIO(o *operation, submit func(o *operation) error) (int, error) {
 			err = waitErr
 		}
 	}
-	return int(o.qty), err
+	return int(qty), err
 }
 
 // fileKind describes the kind of file.
@@ -217,10 +231,10 @@ func (fd *pFD) Init(net string, pollable bool) error {
 	}
 	fd.isFile = fd.kind != kindNet
 	fd.isBlocking = !pollable
-	fd.rop.mode = 'r'
-	fd.wop.mode = 'w'
-	fd.rop.fd = fd
-	fd.wop.fd = fd
+
+	if !pollable {
+		return nil
+	}
 
 	// It is safe to add overlapped handles that also perform I/O
 	// outside of the runtime poller. The runtime poller will ignore
@@ -229,8 +243,6 @@ func (fd *pFD) Init(net string, pollable bool) error {
 	if err != nil {
 		return err
 	}
-	fd.rop.runtimeCtx = fd.pd.runtimeCtx
-	fd.wop.runtimeCtx = fd.pd.runtimeCtx
 	if fd.kind != kindNet || socketCanUseSetFileCompletionNotificationModes {
 		// Non-socket handles can use SetFileCompletionNotificationModes without problems.
 		err := syscall.SetFileCompletionNotificationModes(fd.Sysfd,

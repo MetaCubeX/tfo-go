@@ -1,9 +1,9 @@
-//go:build windows && go1.25 && !go1.26
+//go:build windows && go1.26
 
 package tfo
 
 import (
-	"sync"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -20,16 +20,8 @@ type pFD struct {
 	// System file descriptor. Immutable until Close.
 	Sysfd syscall.Handle
 
-	// Read operation.
-	rop operation
-	// Write operation.
-	wop operation
-
 	// I/O poller.
 	pd pollDesc
-
-	// Used to implement pread/pwrite.
-	l sync.Mutex
 
 	// The file offset for the next read or write.
 	// Overlapped IO operations don't use the real file pointer,
@@ -55,7 +47,7 @@ type pFD struct {
 	// message based socket connection.
 	ZeroReadIsEOF bool
 
-	// Whether this is a file rather than a network socket.
+	// Whether the handle is owned by os.File.
 	isFile bool
 
 	// The kind of this file.
@@ -65,6 +57,11 @@ type pFD struct {
 	isBlocking bool
 
 	disassociated atomic.Bool
+
+	// readPinner and writePinner are automatically unpinned
+	// before execIO returns.
+	readPinner  runtime.Pinner
+	writePinner runtime.Pinner
 }
 
 // Copied from internal/poll/fd_mutex.go
@@ -138,9 +135,8 @@ func (fd *pFD) closing() bool {
 }
 
 func (fd *pFD) ConnectEx(ra syscall.Sockaddr, b []byte) (n int, err error) {
-	fd.wop.sa = ra
-	n, err = execIO(&fd.wop, func(o *operation) error {
-		return syscall.ConnectEx(o.fd.Sysfd, o.sa, &b[0], uint32(len(b)), &o.qty, &o.o)
+	return fd.execIO('w', func(o *operation) (qty uint32, err error) {
+		err = syscall.ConnectEx(fd.Sysfd, ra, &b[0], uint32(len(b)), &qty, &o.o)
+		return
 	})
-	return
 }
