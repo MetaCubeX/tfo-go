@@ -10,8 +10,10 @@ import (
 )
 
 func (lc *ListenConfig) listenTFO(ctx context.Context, network, address string) (net.Listener, error) {
+	// Copy these values to avoid referencing lc in llc.Control.
 	ctrlFn := lc.Control
 	backlog := lc.Backlog
+	fallback := lc.Fallback
 	llc := *lc
 	llc.Control = func(network, address string, c syscall.RawConn) (err error) {
 		if ctrlFn != nil {
@@ -27,7 +29,7 @@ func (lc *ListenConfig) listenTFO(ctx context.Context, network, address string) 
 		}
 
 		if err != nil {
-			if !lc.Fallback || !errors.Is(err, ErrUnsupported) {
+			if !fallback || !errors.Is(err, ErrUnsupported) {
 				return wrapSyscallError("setsockopt(TCP_FASTOPEN)", err)
 			}
 			runtimeListenNoTFO.Store(true)
