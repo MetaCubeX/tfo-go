@@ -49,6 +49,10 @@ type pFD struct {
 	// message based socket connection.
 	ZeroReadIsEOF bool
 
+	// KeepFileCompletionModes prevents Init from changing the file object's
+	// completion notification modes.
+	KeepFileCompletionModes bool
+
 	// Whether the handle is owned by os.File.
 	isFile bool
 
